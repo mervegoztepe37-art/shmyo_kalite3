@@ -1,4 +1,5 @@
-import sqlite3, csv, io
+import sqlite3, csv, io, re, hashlib
+from docx import Document
 import streamlit as st
 import pandas as pd
 
@@ -31,6 +32,42 @@ def execute(sql,args=()):
 
 def choices(table,extra=''):
     return rows(f'SELECT id,name FROM {table} {extra} ORDER BY name')
+
+
+def normalize_question(s):
+    return re.sub(r'\s+',' ',str(s).strip()).casefold()
+
+def parse_docx_questions(upload):
+    # Word paragraphs are read in document XML order; column/section ordering may vary.
+    doc=Document(io.BytesIO(upload.getvalue()))
+    lines=[]
+    for para in doc.paragraphs:
+        for line in para.text.splitlines():
+            if line.strip():lines.append(line.strip())
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for line in cell.text.splitlines():
+                    if line.strip():lines.append(line.strip())
+    question_re=re.compile(r'^\s*(\d{1,3})\s*[).]\s*(.*)$')
+    option_re=re.compile(r'^\s*([A-E])\s*[).]\s*(.*)$',re.I)
+    result=[];current=None;active_option=None
+    for line in lines:
+        qm=question_re.match(line);om=option_re.match(line)
+        if qm and 1<=int(qm.group(1))<=150:
+            if current:result.append(current)
+            current={'number':int(qm.group(1)),'body':qm.group(2).strip(),'options':{}};active_option=None
+        elif om and current:
+            active_option=om.group(1).upper()
+            current['options'][active_option]=om.group(2).strip()
+        elif current and active_option:
+            current['options'][active_option]+=' '+line
+        elif current:
+            current['body']+=' '+line
+    if current:result.append(current)
+    for q in result:
+        q['complete']=bool(q['body']) and all(q['options'].get(k,'').strip() for k in 'ABCDE')
+    return result
 
 st.set_page_config(page_title='SHMYO Ölçme ve Değerlendirme',layout='wide')
 init()
@@ -75,6 +112,39 @@ else:
                     execute('INSERT INTO questions(course_id,outcome_id,body,a,b,c,d,e,correct,bloom) VALUES(?,?,?,?,?,?,?,?,?,?)',(cid,out[0],body,*opts,correct,bloom));st.success('Soru kaydedildi')
                 else:st.error('Soru ve tüm şıklar zorunlu')
         st.dataframe(pd.DataFrame(rows('SELECT q.id,q.body,o.code,q.bloom FROM questions q JOIN outcomes o ON o.id=q.outcome_id WHERE q.course_id=?',(cid,)),columns=['ID','Soru','DÖÇ','Bloom']),hide_index=True)
+        st.divider()
+        st.subheader('Word’den toplu soru ekle')
+        st.caption('DOCX dosyasındaki soru ve A–E seçeneklerini ayırır. Her sorunun doğru cevabı ve DÖÇ bilgisi onaylanmadan kayıt yapılmaz. İki sütunlu veya birden fazla kitapçıklı belgelerde önizlemeyi mutlaka kontrol edin.')
+        file=st.file_uploader('Word sınav kitapçığı (.docx)',type=['docx'],key='bank_word')
+        if file is not None:
+            fingerprint=hashlib.sha256(file.getvalue()).hexdigest()
+            if st.session_state.get('word_file_fingerprint')!=fingerprint or st.session_state.get('word_course_id')!=cid:
+                st.session_state.word_file_fingerprint=fingerprint
+                st.session_state.word_course_id=cid
+                st.session_state.word_parsed=parse_docx_questions(file)
+            parsed=st.session_state.word_parsed
+            st.info(f'{len(parsed)} soru adayı tespit edildi. Bu sayı birden fazla kitapçığı da içerebilir.')
+            if parsed:
+                df=pd.DataFrame([{'Aktar':q['complete'],'Soru no':q['number'],'Soru':q['body'],**{k:q['options'].get(k,'') for k in 'ABCDE'},'Doğru cevap':'','DÖÇ':outs[0][1].split(' - ')[0],'Bloom':'Hatırlama'} for q in parsed])
+                edited=st.data_editor(df,hide_index=True,num_rows='fixed',use_container_width=True,key='word_editor',column_config={'Aktar':st.column_config.CheckboxColumn('Aktar'),'Doğru cevap':st.column_config.SelectboxColumn('Doğru cevap',options=['','A','B','C','D','E']),'DÖÇ':st.column_config.SelectboxColumn('DÖÇ',options=[x[1].split(' - ')[0] for x in outs]),'Bloom':st.column_config.SelectboxColumn('Bloom',options=['Hatırlama','Anlama','Uygulama','Analiz','Değerlendirme','Yaratma'])})
+                st.caption('Aynı sorunun farklı kitapçıklardaki seçenek sırası değişebileceğinden doğru cevapları her satır için kontrol edin. Görseller bu sürümde aktarılmaz.')
+                if st.button('Onaylanan soruları soru bankasına kaydet',type='primary'):
+                    selected=edited[edited['Aktar']==True]
+                    if selected.empty: st.warning('Aktarılacak soru seçilmedi.')
+                    elif selected['Doğru cevap'].isin(list('ABCDE')).sum()!=len(selected):st.error('Her seçilen soru için doğru cevabı seçin.')
+                    elif any(not str(r['Soru']).strip() or any(not str(r[k]).strip() for k in 'ABCDE') for _,r in selected.iterrows()):st.error('Seçilen soruların metin ve A–E seçenekleri eksiksiz olmalı.')
+                    else:
+                        outcome_map={x[1].split(' - ')[0]:x[0] for x in outs}
+                        count=0;duplicates=0
+                        with conn() as c:
+                            existing={(normalize_question(r[0]),tuple(normalize_question(v) for v in r[1:])) for r in c.execute('SELECT body,a,b,c,d,e FROM questions WHERE course_id=?',(cid,)).fetchall()}
+                            for _,r in selected.iterrows():
+                                key=(normalize_question(r['Soru']),tuple(normalize_question(r[k]) for k in 'ABCDE'))
+                                if key in existing:duplicates+=1;continue
+                                c.execute('INSERT INTO questions(course_id,outcome_id,body,a,b,c,d,e,correct,bloom) VALUES(?,?,?,?,?,?,?,?,?,?)',(cid,outcome_map[r['DÖÇ']],r['Soru'],*[r[k] for k in 'ABCDE'],r['Doğru cevap'],r['Bloom']))
+                                existing.add(key);count+=1
+                        st.success(f'{count} soru kaydedildi. {duplicates} birebir tekrar atlandı. Sınav Hazırlama menüsünden seçebilirsiniz.')
+
     elif page=='Sınav Hazırlama':
         qs=rows('SELECT id,body FROM questions WHERE course_id=?',(cid,))
         if not qs:st.info('Önce soru ekleyin.');st.stop()
